@@ -45,7 +45,7 @@ def write_summary(lines: list[str]) -> None:
 
 
 def extract_error_reason(rm_client, job_id: str, job_obj) -> str:
-    """Job එක Fail වුණු නිශ්චිත හේතුව (උදා: Out of host capacity) පමණක් වෙන්කර ගනී."""
+    """Job එක Fail වුණු නිශ්චිත හේතුව පමණක් වෙන්කර ගනී."""
     try:
         logs = rm_client.get_job_logs_content(job_id=job_id).data
         if isinstance(logs, bytes):
@@ -105,6 +105,19 @@ def main():
     stack_id = os.environ["OCI_STACK_OCID"].strip()
     key_content = os.environ["OCI_PRIVATE_KEY"].strip()
 
+    # OCI_STACK_OCID ආකෘතිය පරීක්ෂා කිරීම (රහස් දත්ත පිට නොකර)
+    if not stack_id.startswith("ocid1.ormstack."):
+        hint = "OCI_STACK_OCID අනිවාර්යයෙන්ම 'ocid1.ormstack.' ලෙස ආරම්භ විය යුතුය."
+        if "ocid1.ormjob." in stack_id:
+            hint += " (ඔබ වැරදීමකින් Job OCID එකක් දමා ඇත — Stack OCID එක දමන්න)."
+        elif "=" in stack_id:
+            hint += " (එහි '=' ලකුණක් අඩංගුයි — 'stack=' වැනි කොටස් ඉවත් කර OCID එක පමණක් දමන්න)."
+        elif '"' in stack_id or "'" in stack_id:
+            hint += " (උද්ධෘත පාඨ ඉවත් කර OCID එක පමණක් දමන්න)."
+        write_summary(["## Configuration Error", f"- {hint}"])
+        sys.exit(1)
+
+    current_step = "0. Initializing OCI Client"
     key_fd, key_path = tempfile.mkstemp(prefix="oci_key_", suffix=".pem")
     try:
         with os.fdopen(key_fd, "w", encoding="utf-8") as f:
@@ -124,6 +137,8 @@ def main():
         compute_client = oci.core.ComputeClient(config)
 
         # 1. Stack තොරතුරු සහ Compartment OCID ලබාගැනීම
+        current_step = "1. Fetching Stack details (get_stack)"
+        print(current_step)
         stack = rm_client.get_stack(stack_id=stack_id).data
         compartment_id = stack.compartment_id
 
@@ -136,6 +151,8 @@ def main():
         ]
 
         # 2. දැනටමත් Instance එකක් හැදිලා තියෙනවදැයි පරීක්ෂා කිරීම
+        current_step = "2. Listing Compute Instances (list_instances)"
+        print(current_step)
         instances = compute_client.list_instances(compartment_id=compartment_id).data
         active_instances = [
             inst for inst in instances
@@ -162,6 +179,8 @@ def main():
         summary.append("- **Active Instances:** `0` (තවම සර්වර් එක සෑදී නැත)")
 
         # 3. දැනට Queue වී හෝ ක්‍රියාත්මක වෙමින් පවතින Job එකක් තිබේදැයි පරීක්ෂා කිරීම
+        current_step = "3. Listing recent Stack Jobs (list_jobs)"
+        print(current_step)
         recent_jobs = rm_client.list_jobs(
             stack_id=stack_id,
             sort_by="TIMECREATED",
@@ -175,10 +194,12 @@ def main():
         )
 
         if running_job:
+            current_step = "4a. Tracking existing active job (get_job)"
             print(f"Found an already active job ({running_job.lifecycle_state}). Waiting for it to finish...")
             final_job, timed_out = wait_for_job(rm_client, running_job.id)
             action_note = "Tracked existing active job"
         else:
+            current_step = "4b. Triggering new APPLY job (create_job)"
             print("No active job found. Triggering a new APPLY job...")
             create_details = oci.resource_manager.models.CreateJobDetails(
                 stack_id=stack_id,
@@ -227,14 +248,16 @@ def main():
 
     except oci.exceptions.ServiceError as e:
         safe_msg = redact_sensitive(str(e.message))
+        op_name = getattr(e, "operation_name", "N/A")
         write_summary([
             "## OCI API Notice",
+            f"- **Failed Step:** `{current_step}`",
+            f"- **Operation:** `{op_name}`",
             f"- **HTTP Status:** `{e.status}`",
             f"- **Code:** `{e.code}`",
             f"- **Message:** {safe_msg}",
         ])
-        # Auth errors (401/404) වලදී පමණක් Workflow එක Fail කරයි; Rate limit (429) වලදී ඊළඟ වටයට ඉඩ දෙයි.
-        if e.status in (401, 404):
+        if e.status in (400, 401, 404):
             sys.exit(1)
     finally:
         if os.path.exists(key_path):
