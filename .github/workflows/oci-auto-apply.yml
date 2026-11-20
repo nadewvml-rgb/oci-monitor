@@ -1,4 +1,4 @@
-name: OCI Singapore Auto-Apply
+name: OCI Singapore Auto-Launch
 
 on:
   schedule:
@@ -6,15 +6,14 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
-# දෙකක් එකවර රන් වීම සම්පූර්ණයෙන්ම වළක්වන Lock එක
 concurrency:
-  group: oci-singapore-stack-lock
+  group: oci-singapore-launch-lock
   cancel-in-progress: false
 
 jobs:
-  apply-oci-stack:
+  launch-oci-micro:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -28,12 +27,12 @@ jobs:
       - name: Install OCI SDK
         run: pip install --quiet oci
 
-      - name: Check account status and apply stack
+      - name: Check status and launch Micro instance
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
-          OCI_STACK_OCID: ${{ secrets.OCI_STACK_OCID }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: python apply_stack.py
