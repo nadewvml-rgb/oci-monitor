@@ -10,8 +10,8 @@ import oci
 TARGET_SHAPE = "VM.Standard.E2.1.Micro"
 INSTANCE_DISPLAY_NAME = "sg-micro-vps"
 BOOT_VOLUME_GB = 50
-ATTEMPTS_PER_RUN = 8
-BASE_DELAY_SECONDS = 60
+ATTEMPTS_PER_RUN = 5
+BASE_DELAY_SECONDS = 90
 
 
 def redact_sensitive(text: str) -> str:
