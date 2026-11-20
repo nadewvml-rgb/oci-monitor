@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import sys
 import time
@@ -6,8 +7,11 @@ import tempfile
 from datetime import datetime, timezone
 import oci
 
-POLL_INTERVAL_SECONDS = 20
-MAX_WAIT_SECONDS = 900  # උපරිම විනාඩි 15ක් එක Job එකක ප්‍රතිඵලය එනකම් බලන් ඉන්නවා
+TARGET_SHAPE = "VM.Standard.E2.1.Micro"
+INSTANCE_DISPLAY_NAME = "sg-micro-vps"
+BOOT_VOLUME_GB = 50
+ATTEMPTS_PER_RUN = 8
+BASE_DELAY_SECONDS = 60
 
 
 def redact_sensitive(text: str) -> str:
@@ -44,48 +48,132 @@ def write_summary(lines: list[str]) -> None:
             f.write(content)
 
 
-def extract_error_reason(rm_client, job_id: str, job_obj) -> str:
-    """Job එක Fail වුණු නිශ්චිත හේතුව පමණක් වෙන්කර ගනී."""
-    try:
-        logs = rm_client.get_job_logs_content(job_id=job_id).data
-        if isinstance(logs, bytes):
-            logs = logs.decode("utf-8", errors="ignore")
-        if logs:
-            if "Out of host capacity" in logs or "Out of capacity" in logs:
-                return "Out of host capacity (Singapore වල දැනට ඉඩ නැත)"
-            if "TooManyRequests" in logs:
-                return "TooManyRequests (API සීමාව - ඊළඟ වටයේ නැවත උත්සාහ කරයි)"
-            if "LimitExceeded" in logs:
-                return "LimitExceeded (Free Tier සීමාව ඉක්මවා ඇත)"
-            for line in logs.splitlines():
-                if "Error:" in line or "ServiceError" in line:
-                    return redact_sensitive(line.strip())[:180]
-    except Exception:
-        pass
+def ensure_public_subnet(network_client, compartment_id: str) -> tuple:
+    """දැනට ඇති Public Subnet එක සොයාගනී; නොමැති නම් නව VCN + IGW + Public Subnet එකක් ස්වයංක්‍රීයව සාදයි."""
+    subnets = network_client.list_subnets(compartment_id=compartment_id).data
+    for s in subnets:
+        if s.lifecycle_state == "AVAILABLE" and not s.prohibit_public_ip_on_vnic:
+            return s, f"Existing subnet (`{s.display_name}`)"
 
-    failure = getattr(job_obj, "failure_details", None)
-    if failure and getattr(failure, "message", None):
-        return redact_sensitive(str(failure.message))[:180]
-    return "Unknown failure (Check job state)"
+    vcns = [
+        v for v in network_client.list_vcns(compartment_id=compartment_id).data
+        if v.lifecycle_state == "AVAILABLE"
+    ]
+    if vcns:
+        vcn = vcns[0]
+        vcn_note = f"existing VCN `{vcn.display_name}`"
+    else:
+        print("Creating Always Free VCN...")
+        vcn = network_client.create_vcn(
+            oci.core.models.CreateVcnDetails(
+                cidr_block="10.0.0.0/16",
+                compartment_id=compartment_id,
+                display_name="sg-free-vcn",
+            )
+        ).data
+        vcn = oci.wait_until(
+            network_client,
+            network_client.get_vcn(vcn.id),
+            "lifecycle_state",
+            "AVAILABLE",
+        ).data
+        vcn_note = "newly created VCN"
+
+    igws = [
+        g for g in network_client.list_internet_gateways(
+            compartment_id=compartment_id, vcn_id=vcn.id
+        ).data
+        if g.lifecycle_state == "AVAILABLE"
+    ]
+    if igws:
+        igw = igws[0]
+    else:
+        print("Creating Internet Gateway...")
+        igw = network_client.create_internet_gateway(
+            oci.core.models.CreateInternetGatewayDetails(
+                compartment_id=compartment_id,
+                display_name="sg-free-igw",
+                is_enabled=True,
+                vcn_id=vcn.id,
+            )
+        ).data
+        igw = oci.wait_until(
+            network_client,
+            network_client.get_internet_gateway(igw.id),
+            "lifecycle_state",
+            "AVAILABLE",
+        ).data
+
+    rt = network_client.get_route_table(vcn.default_route_table_id).data
+    has_default_route = any(
+        r.destination == "0.0.0.0/0" for r in (rt.route_rules or [])
+    )
+    if not has_default_route:
+        print("Adding 0.0.0.0/0 internet route...")
+        rules = list(rt.route_rules or [])
+        rules.append(
+            oci.core.models.RouteRule(
+                destination="0.0.0.0/0",
+                destination_type="CIDR_BLOCK",
+                network_entity_id=igw.id,
+            )
+        )
+        network_client.update_route_table(
+            rt_id=vcn.default_route_table_id,
+            update_route_table_details=oci.core.models.UpdateRouteTableDetails(
+                route_rules=rules
+            ),
+        )
+
+    existing_cidrs = {s.cidr_block for s in subnets if s.vcn_id == vcn.id}
+    vcn_prefix = ".".join(vcn.cidr_block.split(".")[:2])
+    subnet_cidr = None
+    for octet in range(0, 255):
+        candidate = f"{vcn_prefix}.{octet}.0/24"
+        if candidate not in existing_cidrs:
+            subnet_cidr = candidate
+            break
+    if not subnet_cidr:
+        raise RuntimeError("Existing VCN තුළ හිස් /24 CIDR පරාසයක් සොයාගත නොහැකි විය.")
+
+    print("Creating Public Subnet...")
+    subnet = network_client.create_subnet(
+        oci.core.models.CreateSubnetDetails(
+            cidr_block=subnet_cidr,
+            compartment_id=compartment_id,
+            display_name="sg-public-subnet",
+            vcn_id=vcn.id,
+            route_table_id=vcn.default_route_table_id,
+            security_list_ids=[vcn.default_security_list_id],
+            prohibit_public_ip_on_vnic=False,
+        )
+    ).data
+    subnet = oci.wait_until(
+        network_client,
+        network_client.get_subnet(subnet.id),
+        "lifecycle_state",
+        "AVAILABLE",
+    ).data
+    return subnet, f"Auto-created public subnet in {vcn_note}"
 
 
-def wait_for_job(rm_client, job_id: str) -> tuple:
-    """Job එක අවසන් වන තුරු බලා සිටී."""
-    start_wait = time.time()
-    while True:
-        job = rm_client.get_job(job_id=job_id).data
-        state = job.lifecycle_state
-        elapsed = format_duration(job.time_created, job.time_finished)
-        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Job State: {state} | Elapsed: {elapsed}")
+def find_ubuntu_image(compute_client, compartment_id: str):
+    """VM.Standard.E2.1.Micro සඳහා ගැළපෙන අලුත්ම Standard Ubuntu Image එක තෝරාගනී."""
+    images = compute_client.list_images(
+        compartment_id=compartment_id,
+        operating_system="Canonical Ubuntu",
+        shape=TARGET_SHAPE,
+        sort_by="TIMECREATED",
+        sort_order="DESC",
+    ).data
+    if not images:
+        raise RuntimeError(f"{TARGET_SHAPE} සඳහා Canonical Ubuntu Image එකක් සොයාගත නොහැකි විය.")
 
-        if state not in ("ACCEPTED", "IN_PROGRESS"):
-            return job, False
-
-        if (time.time() - start_wait) >= MAX_WAIT_SECONDS:
-            print("Max wait limit reached. Exiting cleanly so the next scheduled run continues tracking.")
-            return job, True
-
-        time.sleep(POLL_INTERVAL_SECONDS)
+    for img in images:
+        name = img.display_name or ""
+        if "Minimal" not in name and "GPU" not in name:
+            return img
+    return images[0]
 
 
 def main():
@@ -94,31 +182,35 @@ def main():
         "OCI_FINGERPRINT",
         "OCI_TENANCY_OCID",
         "OCI_REGION",
-        "OCI_STACK_OCID",
         "OCI_PRIVATE_KEY",
+        "SSH_PUBLIC_KEY",
     ]
     missing = [v for v in required_vars if not os.environ.get(v)]
     if missing:
-        print(f"Missing required GitHub Secrets: {', '.join(missing)}")
+        write_summary([
+            "## Missing GitHub Secrets",
+            f"- අඩු Secrets: `{', '.join(missing)}`",
+        ])
         sys.exit(1)
 
-    stack_id = os.environ["OCI_STACK_OCID"].strip()
+    ssh_public_key = os.environ["SSH_PUBLIC_KEY"].strip()
+    if "PRIVATE KEY" in ssh_public_key:
+        write_summary([
+            "## SSH Key Error",
+            "- `SSH_PUBLIC_KEY` තුළ වැරදීමකින් Private Key එකක් ඇතුළත් කර ඇත! කරුණාකර `.pub` ගොනුවේ ඇති Public Key එක (`ssh-ed25519 ...`) පමණක් දමන්න.",
+        ])
+        sys.exit(1)
+    if not ssh_public_key.startswith(("ssh-", "ecdsa-", "sk-")):
+        write_summary([
+            "## SSH Key Error",
+            "- `SSH_PUBLIC_KEY` අගය `ssh-ed25519` හෝ `ssh-rsa` ලෙස ආරම්භ විය යුතුය.",
+        ])
+        sys.exit(1)
+
     key_content = os.environ["OCI_PRIVATE_KEY"].strip()
-
-    # OCI_STACK_OCID ආකෘතිය පරීක්ෂා කිරීම (රහස් දත්ත පිට නොකර)
-    if not stack_id.startswith("ocid1.ormstack."):
-        hint = "OCI_STACK_OCID අනිවාර්යයෙන්ම 'ocid1.ormstack.' ලෙස ආරම්භ විය යුතුය."
-        if "ocid1.ormjob." in stack_id:
-            hint += " (ඔබ වැරදීමකින් Job OCID එකක් දමා ඇත — Stack OCID එක දමන්න)."
-        elif "=" in stack_id:
-            hint += " (එහි '=' ලකුණක් අඩංගුයි — 'stack=' වැනි කොටස් ඉවත් කර OCID එක පමණක් දමන්න)."
-        elif '"' in stack_id or "'" in stack_id:
-            hint += " (උද්ධෘත පාඨ ඉවත් කර OCID එක පමණක් දමන්න)."
-        write_summary(["## Configuration Error", f"- {hint}"])
-        sys.exit(1)
-
-    current_step = "0. Initializing OCI Client"
     key_fd, key_path = tempfile.mkstemp(prefix="oci_key_", suffix=".pem")
+    run_start = datetime.now(timezone.utc)
+
     try:
         with os.fdopen(key_fd, "w", encoding="utf-8") as f:
             f.write(key_content + "\n")
@@ -133,34 +225,26 @@ def main():
         }
         oci.config.validate_config(config)
 
-        rm_client = oci.resource_manager.ResourceManagerClient(config)
+        compartment_id = config["tenancy"]
         compute_client = oci.core.ComputeClient(config)
-
-        # 1. Stack තොරතුරු සහ Compartment OCID ලබාගැනීම
-        current_step = "1. Fetching Stack details (get_stack)"
-        print(current_step)
-        stack = rm_client.get_stack(stack_id=stack_id).data
-        compartment_id = stack.compartment_id
+        network_client = oci.core.VirtualNetworkClient(config)
+        identity_client = oci.identity.IdentityClient(config)
 
         summary = [
-            "## OCI Singapore Auto-Apply Status",
-            f"- **Region:** `{config['region']}`",
-            f"- **Stack State:** `{stack.lifecycle_state}`",
-            f"- **Checked At (UTC):** `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}`",
+            "## OCI Singapore Direct Auto-Launch Status",
+            f"- **Region:** `{config['region']}` | **Target Shape:** `{TARGET_SHAPE}`",
+            f"- **Started (UTC):** `{run_start.strftime('%Y-%m-%d %H:%M:%S')}`",
             "",
         ]
 
-        # 2. දැනටමත් Instance එකක් හැදිලා තියෙනවදැයි පරීක්ෂා කිරීම
-        current_step = "2. Listing Compute Instances (list_instances)"
-        print(current_step)
+        # 1. දැනටමත් සර්වර් එකක් හැදිලා තියෙනවදැයි පරීක්ෂා කිරීම
         instances = compute_client.list_instances(compartment_id=compartment_id).data
         active_instances = [
             inst for inst in instances
             if inst.lifecycle_state not in ("TERMINATED", "TERMINATING")
         ]
-
         if active_instances:
-            summary.append("### Instance Created / Active!")
+            summary.append("### Instance Already Active!")
             summary.append("| Name | Shape | State | Uptime |")
             summary.append("|---|---|---|---|")
             for inst in active_instances:
@@ -170,95 +254,132 @@ def main():
                 )
             summary.append("")
             summary.append(
-                "> සර්වර් එක සාර්ථකව සෑදී ඇත! තවදුරටත් Apply නොකර නතර වේ. "
+                "> සර්වර් එක සාර්ථකව සෑදී ඇත! තවදුරටත් උත්සාහ නොකර නතර වේ. "
                 "දැන් GitHub Actions Workflow එක Disable කරන්න."
             )
             write_summary(summary)
             return
 
-        summary.append("- **Active Instances:** `0` (තවම සර්වර් එක සෑදී නැත)")
+        # 2. Availability Domains, Subnet, සහ Ubuntu Image සූදානම් කරගැනීම
+        ads = identity_client.list_availability_domains(compartment_id=compartment_id).data
+        if not ads:
+            raise RuntimeError("Availability Domains කිසිවක් සොයාගත නොහැකි විය.")
 
-        # 3. දැනට Queue වී හෝ ක්‍රියාත්මක වෙමින් පවතින Job එකක් තිබේදැයි පරීක්ෂා කිරීම
-        current_step = "3. Listing recent Stack Jobs (list_jobs)"
-        print(current_step)
-        recent_jobs = rm_client.list_jobs(
-            stack_id=stack_id,
-            sort_by="TIMECREATED",
-            sort_order="DESC",
-            limit=5,
-        ).data
-
-        running_job = next(
-            (j for j in recent_jobs if j.lifecycle_state in ("ACCEPTED", "IN_PROGRESS")),
-            None,
-        )
-
-        if running_job:
-            current_step = "4a. Tracking existing active job (get_job)"
-            print(f"Found an already active job ({running_job.lifecycle_state}). Waiting for it to finish...")
-            final_job, timed_out = wait_for_job(rm_client, running_job.id)
-            action_note = "Tracked existing active job"
-        else:
-            current_step = "4b. Triggering new APPLY job (create_job)"
-            print("No active job found. Triggering a new APPLY job...")
-            create_details = oci.resource_manager.models.CreateJobDetails(
-                stack_id=stack_id,
-                display_name="auto-apply-gh",
-                job_operation_details=oci.resource_manager.models.CreateApplyJobOperationDetails(
-                    execution_plan_strategy="AUTO_APPROVED"
-                ),
-            )
-            new_job = rm_client.create_job(create_job_details=create_details).data
-            final_job, timed_out = wait_for_job(rm_client, new_job.id)
-            action_note = "Triggered new APPLY job"
-
-        duration = format_duration(final_job.time_created, final_job.time_finished)
-        reason = ""
-        if final_job.lifecycle_state == "FAILED":
-            reason = extract_error_reason(rm_client, final_job.id, final_job)
-        elif final_job.lifecycle_state == "SUCCEEDED":
-            reason = "SUCCESS! සර්වර් එක සාර්ථකව නිර්මාණය විය!"
-        elif timed_out:
-            reason = "තවමත් පෝලිමේ/ක්‍රියාත්මක වෙමින් පවතී (ඊළඟ වටයේදී නැවත පරීක්ෂා කරයි)"
+        subnet, subnet_note = ensure_public_subnet(network_client, compartment_id)
+        image = find_ubuntu_image(compute_client, compartment_id)
 
         summary.extend([
+            f"- **Active Instances:** `0`",
+            f"- **Network:** {subnet_note}",
+            f"- **OS Image:** `{image.display_name}`",
             "",
-            "### Current Run Result",
-            "| Action | Job State | Duration | Details |",
-            "|---|---|---|---|",
-            f"| {action_note} | **{final_job.lifecycle_state}** | `{duration}` | {reason} |",
-            "",
-            "### Recent Job History",
-            "| Operation | State | Started (UTC) | Duration |",
+            "### Launch Attempts",
+            "| # | Time (UTC) | AD | Result |",
             "|---|---|---|---|",
         ])
 
-        updated_jobs = rm_client.list_jobs(
-            stack_id=stack_id,
-            sort_by="TIMECREATED",
-            sort_order="DESC",
-            limit=3,
-        ).data
-        for j in updated_jobs:
-            j_start = j.time_created.strftime("%m-%d %H:%M") if j.time_created else "N/A"
-            j_dur = format_duration(j.time_created, j.time_finished)
-            summary.append(f"| `{j.operation}` | `{j.lifecycle_state}` | `{j_start}` | `{j_dur}` |")
+        created_instance = None
+        stop_early = False
+
+        for attempt in range(1, ATTEMPTS_PER_RUN + 1):
+            for ad in ads:
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                ad_short = ad.name.split(":")[-1]
+                print(f"[Attempt {attempt}/{ATTEMPTS_PER_RUN}] Launching {TARGET_SHAPE} in {ad_short}...")
+
+                launch_details = oci.core.models.LaunchInstanceDetails(
+                    availability_domain=ad.name,
+                    compartment_id=compartment_id,
+                    display_name=INSTANCE_DISPLAY_NAME,
+                    shape=TARGET_SHAPE,
+                    source_details=oci.core.models.InstanceSourceViaImageDetails(
+                        source_type="image",
+                        image_id=image.id,
+                        boot_volume_size_in_gbs=BOOT_VOLUME_GB,
+                    ),
+                    create_vnic_details=oci.core.models.CreateVnicDetails(
+                        subnet_id=subnet.id,
+                        assign_public_ip=True,
+                    ),
+                    metadata={
+                        "ssh_authorized_keys": ssh_public_key,
+                    },
+                )
+
+                try:
+                    resp = compute_client.launch_instance(launch_instance_details=launch_details)
+                    created_instance = resp.data
+                    summary.append(
+                        f"| {attempt} | `{ts}` | `{ad_short}` | **SUCCESS (`{created_instance.lifecycle_state}`)** |"
+                    )
+                    print(f"SUCCESS! Instance created in state: {created_instance.lifecycle_state}")
+                    stop_early = True
+                    break
+
+                except oci.exceptions.ServiceError as e:
+                    msg = str(e.message or "")
+                    if "Out of host capacity" in msg or "Out of capacity" in msg:
+                        status_text = "Out of host capacity (ඉඩ නැත)"
+                        print(f"  -> {status_text}")
+                        summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
+                    elif e.status == 429 or e.code == "TooManyRequests":
+                        status_text = "TooManyRequests (API සීමාව - මේ වටය නවතයි)"
+                        print(f"  -> {status_text}")
+                        summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
+                        stop_early = True
+                        break
+                    elif e.code == "LimitExceeded":
+                        status_text = f"LimitExceeded ({redact_sensitive(msg)[:120]})"
+                        print(f"  -> {status_text}")
+                        summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
+                        stop_early = True
+                        break
+                    else:
+                        status_text = f"HTTP {e.status} ({e.code}): {redact_sensitive(msg)[:120]}"
+                        print(f"  -> {status_text}")
+                        summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
+                        if e.status in (401, 403, 404):
+                            write_summary(summary)
+                            sys.exit(1)
+                        stop_early = True
+                        break
+
+            if stop_early:
+                break
+
+            if attempt < ATTEMPTS_PER_RUN:
+                wait_sec = BASE_DELAY_SECONDS + random.randint(0, 10)
+                print(f"Waiting {wait_sec}s before next attempt...")
+                time.sleep(wait_sec)
+
+        total_dur = format_duration(run_start)
+        summary.append("")
+        if created_instance:
+            summary.append(
+                f"> **සුභ පැතුම්!** `{created_instance.display_name}` (`{TARGET_SHAPE}`) සාර්ථකව නිර්මාණය වෙමින් පවතී! "
+                f"දැන් Workflow එක Disable කර API එකෙන් Public IP එක ලබාගන්න."
+            )
+        else:
+            summary.append(f"- **Run Duration:** `{total_dur}` (ඊළඟ Cron වටයේදී නැවත උත්සාහ කරයි)")
 
         write_summary(summary)
 
     except oci.exceptions.ServiceError as e:
-        safe_msg = redact_sensitive(str(e.message))
-        op_name = getattr(e, "operation_name", "N/A")
         write_summary([
-            "## OCI API Notice",
-            f"- **Failed Step:** `{current_step}`",
-            f"- **Operation:** `{op_name}`",
+            "## OCI API Error",
+            f"- **Operation:** `{getattr(e, 'operation_name', 'N/A')}`",
             f"- **HTTP Status:** `{e.status}`",
             f"- **Code:** `{e.code}`",
-            f"- **Message:** {safe_msg}",
+            f"- **Message:** {redact_sensitive(str(e.message))}",
         ])
-        if e.status in (400, 401, 404):
+        if e.status in (400, 401, 403, 404):
             sys.exit(1)
+    except RuntimeError as e:
+        write_summary([
+            "## Setup Notice",
+            f"- {redact_sensitive(str(e))}",
+        ])
+        sys.exit(1)
     finally:
         if os.path.exists(key_path):
             os.remove(key_path)
