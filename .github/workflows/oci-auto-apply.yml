@@ -1,0 +1,39 @@
+name: OCI Singapore Auto-Apply
+
+on:
+  schedule:
+    # සෑම විනාඩි 15කට වරක් ස්වයංක්‍රීයව ක්‍රියාත්මක වේ
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+# දෙකක් එකවර රන් වීම සම්පූර්ණයෙන්ම වළක්වන Lock එක
+concurrency:
+  group: oci-singapore-stack-lock
+  cancel-in-progress: false
+
+jobs:
+  apply-oci-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install OCI SDK
+        run: pip install --quiet oci
+
+      - name: Check account status and apply stack
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_STACK_OCID: ${{ secrets.OCI_STACK_OCID }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: python apply_stack.py
