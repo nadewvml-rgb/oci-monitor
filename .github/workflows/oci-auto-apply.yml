@@ -1,9 +1,6 @@
 name: OCI Singapore Auto-Launch
 
 on:
-  schedule:
-    # සෑම විනාඩි 15කට වරක් ස්වයංක්‍රීයව ක්‍රියාත්මක වේ
-    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 concurrency:
