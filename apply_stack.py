@@ -6,11 +6,30 @@ import tempfile
 from datetime import datetime, timezone
 import oci
 
-TARGET_SHAPE = "VM.Standard.E2.1.Micro"
-INSTANCE_DISPLAY_NAME = "sg-micro-vps"
 BOOT_VOLUME_GB = 50
-ATTEMPTS_PER_RUN = 5
-BASE_DELAY_SECONDS = 140
+DELAY_BETWEEN_REQUESTS = 95  # OCI 90s rate limit එකට වඩා ආරක්ෂිත පරතරය
+MAX_RUN_SECONDS = 780        # විනාඩි 13න් ආරක්ෂිතව නතර වී summary ලියයි (හැමවිටම < 15m)
+
+TARGETS = [
+    {
+        "label": "Micro",
+        "display_name": "sg-micro-vps",
+        "shape": "VM.Standard.E2.1.Micro",
+        "ocpus": None,
+        "memory_in_gbs": None,
+        "os_version": None,
+        "is_arm": False,
+    },
+    {
+        "label": "Ampere A1",
+        "display_name": "sg-ampere-a1-vps",
+        "shape": "VM.Standard.A1.Flex",
+        "ocpus": 1.0,
+        "memory_in_gbs": 1.0,
+        "os_version": "24.04",
+        "is_arm": True,
+    },
+]
 
 
 def redact_sensitive(text: str) -> str:
@@ -156,22 +175,33 @@ def ensure_public_subnet(network_client, compartment_id: str) -> tuple:
     return subnet, f"Auto-created public subnet in {vcn_note}"
 
 
-def find_ubuntu_image(compute_client, compartment_id: str):
-    """VM.Standard.E2.1.Micro සඳහා ගැළපෙන අලුත්ම Standard Ubuntu Image එක තෝරාගනී."""
-    images = compute_client.list_images(
-        compartment_id=compartment_id,
-        operating_system="Canonical Ubuntu",
-        shape=TARGET_SHAPE,
-        sort_by="TIMECREATED",
-        sort_order="DESC",
-    ).data
+def find_ubuntu_image(compute_client, compartment_id: str, target: dict):
+    """අදාළ Shape එකට ගැළපෙන අලුත්ම Standard Ubuntu Image එක තෝරාගනී."""
+    kwargs = {
+        "compartment_id": compartment_id,
+        "operating_system": "Canonical Ubuntu",
+        "shape": target["shape"],
+        "sort_by": "TIMECREATED",
+        "sort_order": "DESC",
+    }
+    if target["os_version"]:
+        kwargs["operating_system_version"] = target["os_version"]
+
+    images = compute_client.list_images(**kwargs).data
     if not images:
-        raise RuntimeError(f"{TARGET_SHAPE} සඳහා Canonical Ubuntu Image එකක් සොයාගත නොහැකි විය.")
+        raise RuntimeError(f"{target['shape']} සඳහා Canonical Ubuntu Image එකක් සොයාගත නොහැකි විය.")
+
+    if target["is_arm"]:
+        for img in images:
+            name = (img.display_name or "").lower()
+            if "aarch64" in name and "minimal" not in name and "gpu" not in name:
+                return img
 
     for img in images:
-        name = img.display_name or ""
-        if "Minimal" not in name and "GPU" not in name:
+        name = (img.display_name or "").lower()
+        if "minimal" not in name and "gpu" not in name:
             return img
+
     return images[0]
 
 
@@ -196,7 +226,7 @@ def main():
     if "PRIVATE KEY" in ssh_public_key:
         write_summary([
             "## SSH Key Error",
-            "- `SSH_PUBLIC_KEY` තුළ වැරදීමකින් Private Key එකක් ඇතුළත් කර ඇත! කරුණාකර `.pub` ගොනුවේ ඇති Public Key එක (`ssh-ed25519 ...`) පමණක් දමන්න.",
+            "- `SSH_PUBLIC_KEY` තුළ වැරදීමකින් Private Key එකක් ඇතුළත් කර ඇත! `.pub` Public Key එක පමණක් දමන්න.",
         ])
         sys.exit(1)
     if not ssh_public_key.startswith(("ssh-", "ecdsa-", "sk-")):
@@ -209,6 +239,7 @@ def main():
     key_content = os.environ["OCI_PRIVATE_KEY"].strip()
     key_fd, key_path = tempfile.mkstemp(prefix="oci_key_", suffix=".pem")
     run_start = datetime.now(timezone.utc)
+    mono_start = time.monotonic()
 
     try:
         with os.fdopen(key_fd, "w", encoding="utf-8") as f:
@@ -225,28 +256,27 @@ def main():
         oci.config.validate_config(config)
 
         compartment_id = config["tenancy"]
-        # NoneRetryStrategy: HTTP 500 (Out of host capacity) වලට SDK එක ඇතුළෙන් retry වීම නවතයි
         no_retry = oci.retry.NoneRetryStrategy()
         compute_client = oci.core.ComputeClient(config, retry_strategy=no_retry)
         network_client = oci.core.VirtualNetworkClient(config)
         identity_client = oci.identity.IdentityClient(config)
 
         summary = [
-            "## OCI Singapore Direct Auto-Launch Status",
-            f"- **Region:** `{config['region']}` | **Target Shape:** `{TARGET_SHAPE}`",
-            f"- **Started (UTC):** `{run_start.strftime('%Y-%m-%d %H:%M:%S')}`",
+            "## OCI Singapore Combined Auto-Launch Status",
+            f"- **Region:** `{config['region']}` | **Started (UTC):** `{run_start.strftime('%Y-%m-%d %H:%M:%S')}`",
             "",
         ]
 
-        # 1. දැනටමත් VM.Standard.E2.1.Micro සර්වර් එකක් හැදිලා තියෙනවදැයි පරීක්ෂා කිරීම
+        # 1. දැනටමත් හැදිලා තියෙන සර්වර් පරීක්ෂා කිරීම
         instances = compute_client.list_instances(compartment_id=compartment_id).data
         active_instances = [
             inst for inst in instances
             if inst.lifecycle_state not in ("TERMINATED", "TERMINATING")
-            and inst.shape == TARGET_SHAPE
         ]
+        active_shapes = {inst.shape for inst in active_instances}
+
         if active_instances:
-            summary.append("### Instance Already Active!")
+            summary.append("### Active Instances")
             summary.append("| Name | Shape | State | Uptime |")
             summary.append("|---|---|---|---|")
             for inst in active_instances:
@@ -255,113 +285,142 @@ def main():
                     f"| `{inst.display_name}` | `{inst.shape}` | **{inst.lifecycle_state}** | `{uptime}` |"
                 )
             summary.append("")
+
+        pending_targets = [t for t in TARGETS if t["shape"] not in active_shapes]
+        if not pending_targets:
             summary.append(
-                "> සර්වර් එක සාර්ථකව සෑදී ඇත! තවදුරටත් උත්සාහ නොකර නතර වේ."
+                "> **Micro සහ Ampere A1 සර්වර් දෙකම සාර්ථකව සෑදී ඇත!** "
+                "දැන් GitHub Actions Workflow එක Disable කරන්න."
             )
             write_summary(summary)
             return
 
-        # 2. Availability Domains, Subnet, සහ Ubuntu Image සූදානම් කරගැනීම
+        # 2. AD, Subnet, සහ අදාළ OS Images එක් වරක් පමණක් ලබාගැනීම
         ads = identity_client.list_availability_domains(compartment_id=compartment_id).data
         if not ads:
             raise RuntimeError("Availability Domains කිසිවක් සොයාගත නොහැකි විය.")
 
         subnet, subnet_note = ensure_public_subnet(network_client, compartment_id)
-        image = find_ubuntu_image(compute_client, compartment_id)
+        images_by_shape = {}
+        for t in pending_targets:
+            images_by_shape[t["shape"]] = find_ubuntu_image(compute_client, compartment_id, t)
+
+        summary.append(f"- **Network:** {subnet_note}")
+        for t in pending_targets:
+            summary.append(f"- **{t['label']} Image:** `{images_by_shape[t['shape']].display_name}`")
 
         summary.extend([
-            f"- **Active `{TARGET_SHAPE}` Instances:** `0`",
-            f"- **Network:** {subnet_note}",
-            f"- **OS Image:** `{image.display_name}`",
             "",
-            "### Launch Attempts",
-            "| # | Time (UTC) | AD | Result |",
-            "|---|---|---|---|",
+            "### Launch Attempts (95s Alternating Spacing)",
+            "| # | Time (UTC) | Target | AD | Result |",
+            "|---|---|---|---|---|",
         ])
 
-        created_instance = None
-        stop_early = False
+        # Target 2ක් තියෙනවා නම් 4 බැගින් (මුළු 8ක් = ~11.5m); 1ක් නම් 5ක් (~6.5m)
+        attempts_per_target = 4 if len(pending_targets) > 1 else 5
+        launch_queue = []
+        for _ in range(attempts_per_target):
+            for t in pending_targets:
+                launch_queue.append(t)
 
-        for attempt in range(1, ATTEMPTS_PER_RUN + 1):
-            for ad in ads:
-                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                ad_short = ad.name.split(":")[-1]
-                print(f"[Attempt {attempt}/{ATTEMPTS_PER_RUN}] Launching {TARGET_SHAPE} in {ad_short}...")
+        done_shapes = set()
+        created_instances = []
+        step_num = 0
 
-                launch_details = oci.core.models.LaunchInstanceDetails(
-                    availability_domain=ad.name,
-                    compartment_id=compartment_id,
-                    display_name=INSTANCE_DISPLAY_NAME,
-                    shape=TARGET_SHAPE,
-                    source_details=oci.core.models.InstanceSourceViaImageDetails(
-                        source_type="image",
-                        image_id=image.id,
-                        boot_volume_size_in_gbs=BOOT_VOLUME_GB,
-                    ),
-                    create_vnic_details=oci.core.models.CreateVnicDetails(
-                        subnet_id=subnet.id,
-                        assign_public_ip=True,
-                    ),
-                    metadata={
-                        "ssh_authorized_keys": ssh_public_key,
-                    },
+        for idx, target in enumerate(launch_queue):
+            if target["shape"] in done_shapes:
+                continue
+
+            ad = ads[0]
+            step_num += 1
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            ad_short = ad.name.split(":")[-1]
+            print(f"[Step {step_num}] Launching {target['shape']} ({target['display_name']}) in {ad_short}...")
+
+            launch_kwargs = {
+                "availability_domain": ad.name,
+                "compartment_id": compartment_id,
+                "display_name": target["display_name"],
+                "shape": target["shape"],
+                "source_details": oci.core.models.InstanceSourceViaImageDetails(
+                    source_type="image",
+                    image_id=images_by_shape[target["shape"]].id,
+                    boot_volume_size_in_gbs=BOOT_VOLUME_GB,
+                ),
+                "create_vnic_details": oci.core.models.CreateVnicDetails(
+                    subnet_id=subnet.id,
+                    assign_public_ip=True,
+                ),
+                "metadata": {
+                    "ssh_authorized_keys": ssh_public_key,
+                },
+            }
+            if target["ocpus"] is not None and target["memory_in_gbs"] is not None:
+                launch_kwargs["shape_config"] = oci.core.models.LaunchInstanceShapeConfigDetails(
+                    ocpus=target["ocpus"],
+                    memory_in_gbs=target["memory_in_gbs"],
                 )
 
-                try:
-                    resp = compute_client.launch_instance(
-                        launch_instance_details=launch_details,
-                        retry_strategy=no_retry,
-                    )
-                    created_instance = resp.data
-                    summary.append(
-                        f"| {attempt} | `{ts}` | `{ad_short}` | **SUCCESS (`{created_instance.lifecycle_state}`)** |"
-                    )
-                    print(f"SUCCESS! Instance created in state: {created_instance.lifecycle_state}")
-                    stop_early = True
-                    break
+            launch_details = oci.core.models.LaunchInstanceDetails(**launch_kwargs)
 
-                except oci.exceptions.ServiceError as e:
-                    msg = str(e.message or "")
-                    if "Out of host capacity" in msg or "Out of capacity" in msg:
-                        status_text = "Out of host capacity (ඉඩ නැත)"
-                        print(f"  -> {status_text}")
-                        summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
-                    elif e.status == 429 or e.code == "TooManyRequests":
-                        status_text = "TooManyRequests (ඊළඟ වටය තෙක් රැඳී සිටී)"
-                        print(f"  -> {status_text}")
-                        summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
-                    elif e.code == "LimitExceeded":
-                        status_text = f"LimitExceeded ({redact_sensitive(msg)[:120]})"
-                        print(f"  -> {status_text}")
-                        summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
-                        stop_early = True
-                        break
-                    else:
-                        status_text = f"HTTP {e.status} ({e.code}): {redact_sensitive(msg)[:120]}"
-                        print(f"  -> {status_text}")
-                        summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
-                        if e.status in (401, 403, 404):
-                            write_summary(summary)
-                            sys.exit(1)
-                        stop_early = True
-                        break
+            try:
+                resp = compute_client.launch_instance(
+                    launch_instance_details=launch_details,
+                    retry_strategy=no_retry,
+                )
+                inst = resp.data
+                created_instances.append(inst)
+                done_shapes.add(target["shape"])
+                summary.append(
+                    f"| {step_num} | `{ts}` | `{target['label']}` | `{ad_short}` | **SUCCESS (`{inst.lifecycle_state}`)** |"
+                )
+                print(f"  -> SUCCESS! {inst.display_name} created ({inst.lifecycle_state})")
 
-            if stop_early:
+            except oci.exceptions.ServiceError as e:
+                msg = str(e.message or "")
+                if "Out of host capacity" in msg or "Out of capacity" in msg:
+                    status_text = "Out of host capacity (ඉඩ නැත)"
+                elif e.status == 429 or e.code == "TooManyRequests":
+                    status_text = f"TooManyRequests ({redact_sensitive(msg)[:100]})"
+                elif e.code == "LimitExceeded":
+                    status_text = f"LimitExceeded ({redact_sensitive(msg)[:100]})"
+                    done_shapes.add(target["shape"])
+                else:
+                    status_text = f"HTTP {e.status} ({e.code}): {redact_sensitive(msg)[:100]}"
+                    if e.status in (401, 403, 404):
+                        summary.append(
+                            f"| {step_num} | `{ts}` | `{target['label']}` | `{ad_short}` | {status_text} |"
+                        )
+                        write_summary(summary)
+                        sys.exit(1)
+                    done_shapes.add(target["shape"])
+
+                print(f"  -> {status_text}")
+                summary.append(
+                    f"| {step_num} | `{ts}` | `{target['label']}` | `{ad_short}` | {status_text} |"
+                )
+
+            # තව ඉතුරු targets තියෙනවද සහ ඊළඟ sleep එකෙන් පස්සේ 13m ඉක්මවනවද බැලීම
+            has_more = any(t["shape"] not in done_shapes for t in launch_queue[idx + 1:])
+            if not has_more:
                 break
 
-            if attempt < ATTEMPTS_PER_RUN:
-                print(f"Waiting {BASE_DELAY_SECONDS}s before next attempt...")
-                time.sleep(BASE_DELAY_SECONDS)
+            elapsed = time.monotonic() - mono_start
+            if elapsed + DELAY_BETWEEN_REQUESTS > MAX_RUN_SECONDS:
+                print("Approaching 13m safety cap; ending run cleanly.")
+                break
+
+            print(f"Waiting {DELAY_BETWEEN_REQUESTS}s before next launch request...")
+            time.sleep(DELAY_BETWEEN_REQUESTS)
 
         total_dur = format_duration(run_start)
         summary.append("")
-        if created_instance:
+        if created_instances:
+            names = ", ".join(f"`{i.display_name}` (`{i.shape}`)" for i in created_instances)
             summary.append(
-                f"> **සුභ පැතුම්!** `{created_instance.display_name}` (`{TARGET_SHAPE}`) සාර්ථකව නිර්මාණය වෙමින් පවතී! "
-                f"Oracle Console එකෙන් Public IP එක ලබාගන්න."
+                f"> **සුභ පැතුම්!** {names} සාර්ථකව නිර්මාණය වෙමින් පවතී! Oracle Console එකෙන් Public IP එක ලබාගන්න."
             )
-        else:
-            summary.append(f"- **Run Duration:** `{total_dur}` (ඊළඟ වටයේදී නැවත උත්සාහ කරයි)")
+        summary.append(f"- **Run Duration:** `{total_dur}`")
 
         write_summary(summary)
 
