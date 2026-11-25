@@ -7,8 +7,10 @@ import tempfile
 from datetime import datetime, timezone
 import oci
 
-TARGET_SHAPE = "VM.Standard.E2.1.Micro"
-INSTANCE_DISPLAY_NAME = "sg-micro-vps"
+TARGET_SHAPE = "VM.Standard.A1.Flex"
+OCPUS = 20.0
+MEMORY_IN_GBS = 64.0
+INSTANCE_DISPLAY_NAME = "sg-ampere-a1-vps"
 BOOT_VOLUME_GB = 50
 ATTEMPTS_PER_RUN = 5
 BASE_DELAY_SECONDS = 90
@@ -63,12 +65,12 @@ def ensure_public_subnet(network_client, compartment_id: str) -> tuple:
         vcn = vcns[0]
         vcn_note = f"existing VCN `{vcn.display_name}`"
     else:
-        print("Creating Always Free VCN...")
+        print("Creating VCN...")
         vcn = network_client.create_vcn(
             oci.core.models.CreateVcnDetails(
                 cidr_block="10.0.0.0/16",
                 compartment_id=compartment_id,
-                display_name="sg-free-vcn",
+                display_name="sg-a1-vcn",
             )
         ).data
         vcn = oci.wait_until(
@@ -92,7 +94,7 @@ def ensure_public_subnet(network_client, compartment_id: str) -> tuple:
         igw = network_client.create_internet_gateway(
             oci.core.models.CreateInternetGatewayDetails(
                 compartment_id=compartment_id,
-                display_name="sg-free-igw",
+                display_name="sg-a1-igw",
                 is_enabled=True,
                 vcn_id=vcn.id,
             )
@@ -157,22 +159,33 @@ def ensure_public_subnet(network_client, compartment_id: str) -> tuple:
     return subnet, f"Auto-created public subnet in {vcn_note}"
 
 
-def find_ubuntu_image(compute_client, compartment_id: str):
-    """VM.Standard.E2.1.Micro සඳහා ගැළපෙන අලුත්ම Standard Ubuntu Image එක තෝරාගනී."""
+def find_ubuntu_2404_arm_image(compute_client, compartment_id: str):
+    """VM.Standard.A1.Flex සඳහා ගැළපෙන අලුත්ම Standard Canonical Ubuntu 24.04 (ARM / aarch64) Image එක තෝරාගනී."""
     images = compute_client.list_images(
         compartment_id=compartment_id,
         operating_system="Canonical Ubuntu",
+        operating_system_version="24.04",
         shape=TARGET_SHAPE,
         sort_by="TIMECREATED",
         sort_order="DESC",
     ).data
     if not images:
-        raise RuntimeError(f"{TARGET_SHAPE} සඳහා Canonical Ubuntu Image එකක් සොයාගත නොහැකි විය.")
+        raise RuntimeError(
+            f"{TARGET_SHAPE} සඳහා Canonical Ubuntu 24.04 (ARM / aarch64) Image එකක් සොයාගත නොහැකි විය."
+        )
 
+    # 1. ප්‍රමුඛතාව: Standard (Minimal සහ GPU නොවන) aarch64 Ubuntu 24.04 Image එක
     for img in images:
-        name = img.display_name or ""
-        if "Minimal" not in name and "GPU" not in name:
+        name = (img.display_name or "").lower()
+        if "aarch64" in name and "minimal" not in name and "gpu" not in name:
             return img
+
+    # 2. දෙවන විකල්පය: aarch64 නමේ නැතත් shape filter එකෙන් ආ Standard 24.04 Image එක
+    for img in images:
+        name = (img.display_name or "").lower()
+        if "minimal" not in name and "gpu" not in name:
+            return img
+
     return images[0]
 
 
@@ -231,47 +244,55 @@ def main():
         identity_client = oci.identity.IdentityClient(config)
 
         summary = [
-            "## OCI Singapore Direct Auto-Launch Status",
-            f"- **Region:** `{config['region']}` | **Target Shape:** `{TARGET_SHAPE}`",
+            "## OCI Ampere A1 Auto-Launch Status",
+            f"- **Region:** `{config['region']}` | **Target Shape:** `{TARGET_SHAPE}` (`{int(OCPUS)} OCPU / {int(MEMORY_IN_GBS)} GB RAM`)",
             f"- **Started (UTC):** `{run_start.strftime('%Y-%m-%d %H:%M:%S')}`",
             "",
         ]
 
-        # 1. දැනටමත් සර්වර් එකක් හැදිලා තියෙනවදැයි පරීක්ෂා කිරීම
+        # 1. දැනටමත් VM.Standard.A1.Flex සර්වර් එකක් හැදිලා තියෙනවදැයි පරීක්ෂා කිරීම
         instances = compute_client.list_instances(compartment_id=compartment_id).data
-        active_instances = [
+        active_target_instances = [
             inst for inst in instances
             if inst.lifecycle_state not in ("TERMINATED", "TERMINATING")
+            and inst.shape == TARGET_SHAPE
         ]
-        if active_instances:
-            summary.append("### Instance Already Active!")
-            summary.append("| Name | Shape | State | Uptime |")
-            summary.append("|---|---|---|---|")
-            for inst in active_instances:
+        if active_target_instances:
+            summary.append("### Ampere A1 Instance Already Active!")
+            summary.append("| Name | Shape | Specs | State | Uptime |")
+            summary.append("|---|---|---|---|---|")
+            for inst in active_target_instances:
                 uptime = format_duration(inst.time_created)
+                sc = getattr(inst, "shape_config", None)
+                specs = (
+                    f"{sc.ocpus:g} OCPU / {sc.memory_in_gbs:g} GB"
+                    if sc and sc.ocpus and sc.memory_in_gbs
+                    else "N/A"
+                )
                 summary.append(
-                    f"| `{inst.display_name}` | `{inst.shape}` | **{inst.lifecycle_state}** | `{uptime}` |"
+                    f"| `{inst.display_name}` | `{inst.shape}` | `{specs}` | **{inst.lifecycle_state}** | `{uptime}` |"
                 )
             summary.append("")
             summary.append(
-                "> සර්වර් එක සාර්ථකව සෑදී ඇත! තවදුරටත් උත්සාහ නොකර නතර වේ. "
+                "> Ampere A1 සර්වර් එක සාර්ථකව සෑදී ඇත! තවදුරටත් උත්සාහ නොකර නතර වේ. "
                 "දැන් GitHub Actions Workflow එක Disable කරන්න."
             )
             write_summary(summary)
             return
 
-        # 2. Availability Domains, Subnet, සහ Ubuntu Image සූදානම් කරගැනීම
+        # 2. Availability Domains, Subnet, සහ Ubuntu 24.04 ARM Image සූදානම් කරගැනීම
         ads = identity_client.list_availability_domains(compartment_id=compartment_id).data
         if not ads:
             raise RuntimeError("Availability Domains කිසිවක් සොයාගත නොහැකි විය.")
 
         subnet, subnet_note = ensure_public_subnet(network_client, compartment_id)
-        image = find_ubuntu_image(compute_client, compartment_id)
+        image = find_ubuntu_2404_arm_image(compute_client, compartment_id)
 
         summary.extend([
-            f"- **Active Instances:** `0`",
+            f"- **Active `{TARGET_SHAPE}` Instances:** `0`",
             f"- **Network:** {subnet_note}",
             f"- **OS Image:** `{image.display_name}`",
+            f"- **Boot Volume:** `{BOOT_VOLUME_GB} GB`",
             "",
             "### Launch Attempts",
             "| # | Time (UTC) | AD | Result |",
@@ -285,13 +306,20 @@ def main():
             for ad in ads:
                 ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
                 ad_short = ad.name.split(":")[-1]
-                print(f"[Attempt {attempt}/{ATTEMPTS_PER_RUN}] Launching {TARGET_SHAPE} in {ad_short}...")
+                print(
+                    f"[Attempt {attempt}/{ATTEMPTS_PER_RUN}] Launching {TARGET_SHAPE} "
+                    f"({int(OCPUS)} OCPU / {int(MEMORY_IN_GBS)} GB) in {ad_short}..."
+                )
 
                 launch_details = oci.core.models.LaunchInstanceDetails(
                     availability_domain=ad.name,
                     compartment_id=compartment_id,
                     display_name=INSTANCE_DISPLAY_NAME,
                     shape=TARGET_SHAPE,
+                    shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
+                        ocpus=OCPUS,
+                        memory_in_gbs=MEMORY_IN_GBS,
+                    ),
                     source_details=oci.core.models.InstanceSourceViaImageDetails(
                         source_type="image",
                         image_id=image.id,
@@ -356,8 +384,9 @@ def main():
         summary.append("")
         if created_instance:
             summary.append(
-                f"> **සුභ පැතුම්!** `{created_instance.display_name}` (`{TARGET_SHAPE}`) සාර්ථකව නිර්මාණය වෙමින් පවතී! "
-                f"දැන් Workflow එක Disable කර API එකෙන් Public IP එක ලබාගන්න."
+                f"> **සුභ පැතුම්!** `{created_instance.display_name}` (`{TARGET_SHAPE}` - "
+                f"`{int(OCPUS)} OCPU / {int(MEMORY_IN_GBS)} GB RAM`) සාර්ථකව නිර්මාණය වෙමින් පවතී! "
+                f"දැන් Workflow එක Disable කර Oracle Console එකෙන් Public IP එක ලබාගන්න."
             )
         else:
             summary.append(f"- **Run Duration:** `{total_dur}` (ඊළඟ Cron වටයේදී නැවත උත්සාහ කරයි)")
