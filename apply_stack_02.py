@@ -1,5 +1,4 @@
 import os
-import random
 import re
 import sys
 import time
@@ -13,7 +12,7 @@ MEMORY_IN_GBS = 1.0
 INSTANCE_DISPLAY_NAME = "sg-ampere-a1-vps"
 BOOT_VOLUME_GB = 50
 ATTEMPTS_PER_RUN = 5
-BASE_DELAY_SECONDS = 90
+BASE_DELAY_SECONDS = 140
 
 
 def redact_sensitive(text: str) -> str:
@@ -218,11 +217,6 @@ def main():
         ])
         sys.exit(1)
 
-    # [TRICK 1]: Script දෙකම එකම තත්පරයේ API call කරන එක නවත්තන්න random Jitter delay එකක්
-    initial_jitter = random.uniform(3, 18)
-    print(f"Applying initial anti-collision jitter: {initial_jitter:.1f}s...")
-    time.sleep(initial_jitter)
-
     key_content = os.environ["OCI_PRIVATE_KEY"].strip()
     key_fd, key_path = tempfile.mkstemp(prefix="oci_key_", suffix=".pem")
     run_start = datetime.now(timezone.utc)
@@ -242,12 +236,11 @@ def main():
         oci.config.validate_config(config)
 
         compartment_id = config["tenancy"]
-
-        # [TRICK 2]: OCI Default Retry Strategy එක හැම Client එකකටම Enable කිරීම
-        retry_strategy = oci.retry.DEFAULT_RETRY_STRATEGY
-        compute_client = oci.core.ComputeClient(config, retry_strategy=retry_strategy)
-        network_client = oci.core.VirtualNetworkClient(config, retry_strategy=retry_strategy)
-        identity_client = oci.identity.IdentityClient(config, retry_strategy=retry_strategy)
+        # NoneRetryStrategy: HTTP 500 (Out of host capacity) වලට SDK එක ඇතුළෙන් retry වීම නවතයි
+        no_retry = oci.retry.NoneRetryStrategy()
+        compute_client = oci.core.ComputeClient(config, retry_strategy=no_retry)
+        network_client = oci.core.VirtualNetworkClient(config)
+        identity_client = oci.identity.IdentityClient(config)
 
         summary = [
             "## OCI Ampere A1 Auto-Launch Status",
@@ -280,8 +273,7 @@ def main():
                 )
             summary.append("")
             summary.append(
-                "> Ampere A1 සර්වර් එක සාර්ථකව සෑදී ඇත! තවදුරටත් උත්සාහ නොකර නතර වේ. "
-                "දැන් GitHub Actions Workflow එක Disable කරන්න."
+                "> Ampere A1 සර්වර් එක සාර්ථකව සෑදී ඇත! තවදුරටත් උත්සාහ නොකර නතර වේ."
             )
             write_summary(summary)
             return
@@ -309,11 +301,7 @@ def main():
         stop_early = False
 
         for attempt in range(1, ATTEMPTS_PER_RUN + 1):
-            # [TRICK 3]: AD list එක shuffle කිරීම (script දෙකම එකම AD එකට එකපාර request නොයවන්න)
-            shuffled_ads = list(ads)
-            random.shuffle(shuffled_ads)
-
-            for idx, ad in enumerate(shuffled_ads):
+            for ad in ads:
                 ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
                 ad_short = ad.name.split(":")[-1]
                 print(
@@ -345,7 +333,10 @@ def main():
                 )
 
                 try:
-                    resp = compute_client.launch_instance(launch_instance_details=launch_details)
+                    resp = compute_client.launch_instance(
+                        launch_instance_details=launch_details,
+                        retry_strategy=no_retry,
+                    )
                     created_instance = resp.data
                     summary.append(
                         f"| {attempt} | `{ts}` | `{ad_short}` | **SUCCESS (`{created_instance.lifecycle_state}`)** |"
@@ -360,15 +351,10 @@ def main():
                         status_text = "Out of host capacity (ඉඩ නැත)"
                         print(f"  -> {status_text}")
                         summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
-
                     elif e.status == 429 or e.code == "TooManyRequests":
-                        # [TRICK 4]: 429 ආවොත් script එක නවත්තන්නේ නැතුව තත්පර 65ක් cooldown වෙලා දිගටම යනවා
-                        status_text = "TooManyRequests (තත්පර 65ක් රැඳී සිටී...)"
+                        status_text = "TooManyRequests (ඊළඟ වටය තෙක් රැඳී සිටී)"
                         print(f"  -> {status_text}")
                         summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
-                        time.sleep(65)
-                        continue
-
                     elif e.code == "LimitExceeded":
                         status_text = f"LimitExceeded ({redact_sensitive(msg)[:120]})"
                         print(f"  -> {status_text}")
@@ -385,19 +371,12 @@ def main():
                         stop_early = True
                         break
 
-                # [TRICK 5]: එක AD එකකට request යවලා ඊළඟ AD එකට යන්න කලින් තත්පර 12-18ක් delay එකක් දීම
-                if idx < len(shuffled_ads) - 1:
-                    ad_delay = random.uniform(12, 18)
-                    print(f"  -> Waiting {ad_delay:.1f}s before next AD...")
-                    time.sleep(ad_delay)
-
             if stop_early:
                 break
 
             if attempt < ATTEMPTS_PER_RUN:
-                wait_sec = BASE_DELAY_SECONDS + random.randint(5, 20)
-                print(f"Waiting {wait_sec}s before next attempt...")
-                time.sleep(wait_sec)
+                print(f"Waiting {BASE_DELAY_SECONDS}s before next attempt...")
+                time.sleep(BASE_DELAY_SECONDS)
 
         total_dur = format_duration(run_start)
         summary.append("")
@@ -405,10 +384,10 @@ def main():
             summary.append(
                 f"> **සුභ පැතුම්!** `{created_instance.display_name}` (`{TARGET_SHAPE}` - "
                 f"`{int(OCPUS)} OCPU / {int(MEMORY_IN_GBS)} GB RAM`) සාර්ථකව නිර්මාණය වෙමින් පවතී! "
-                f"දැන් Workflow එක Disable කර Oracle Console එකෙන් Public IP එක ලබාගන්න."
+                f"Oracle Console එකෙන් Public IP එක ලබාගන්න."
             )
         else:
-            summary.append(f"- **Run Duration:** `{total_dur}` (ඊළඟ Cron වටයේදී නැවත උත්සාහ කරයි)")
+            summary.append(f"- **Run Duration:** `{total_dur}` (ඊළඟ වටයේදී නැවත උත්සාහ කරයි)")
 
         write_summary(summary)
 
