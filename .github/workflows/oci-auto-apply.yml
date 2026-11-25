@@ -11,10 +11,9 @@ jobs:
   launch-oci:
     name: Run ${{ matrix.script }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
     strategy:
       fail-fast: false
-      max-parallel: 1 # <--- මේකෙන් script දෙක එකම වෙලාවේ run වෙන එක නවත්තනවා
       matrix:
         script: [apply_stack.py, apply_stack_02.py]
 
@@ -39,9 +38,8 @@ jobs:
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
-          # දෙවෙනි script එකට කලින් තත්පර 30ක විවේකයක් දෙනවා
           if [ "${{ matrix.script }}" == "apply_stack_02.py" ]; then
-            echo "Cooling down for 30 seconds..."
-            sleep 30
+            echo "Staggering start by 70s so requests alternate cleanly..."
+            sleep 70
           fi
           python ${{ matrix.script }}
