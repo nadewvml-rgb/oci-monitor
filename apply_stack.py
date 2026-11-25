@@ -207,6 +207,11 @@ def main():
         ])
         sys.exit(1)
 
+    # Script දෙකම එකම තත්පරයේ API call කරන එක නවත්තන්න random Jitter delay එකක්
+    initial_jitter = random.uniform(1, 10)
+    print(f"Applying initial anti-collision jitter: {initial_jitter:.1f}s...")
+    time.sleep(initial_jitter)
+
     key_content = os.environ["OCI_PRIVATE_KEY"].strip()
     key_fd, key_path = tempfile.mkstemp(prefix="oci_key_", suffix=".pem")
     run_start = datetime.now(timezone.utc)
@@ -226,9 +231,10 @@ def main():
         oci.config.validate_config(config)
 
         compartment_id = config["tenancy"]
-        compute_client = oci.core.ComputeClient(config)
-        network_client = oci.core.VirtualNetworkClient(config)
-        identity_client = oci.identity.IdentityClient(config)
+        retry_strategy = oci.retry.DEFAULT_RETRY_STRATEGY
+        compute_client = oci.core.ComputeClient(config, retry_strategy=retry_strategy)
+        network_client = oci.core.VirtualNetworkClient(config, retry_strategy=retry_strategy)
+        identity_client = oci.identity.IdentityClient(config, retry_strategy=retry_strategy)
 
         summary = [
             "## OCI Singapore Direct Auto-Launch Status",
@@ -237,11 +243,12 @@ def main():
             "",
         ]
 
-        # 1. දැනටමත් සර්වර් එකක් හැදිලා තියෙනවදැයි පරීක්ෂා කිරීම
+        # 1. දැනටමත් VM.Standard.E2.1.Micro සර්වර් එකක් හැදිලා තියෙනවදැයි පරීක්ෂා කිරීම
         instances = compute_client.list_instances(compartment_id=compartment_id).data
         active_instances = [
             inst for inst in instances
             if inst.lifecycle_state not in ("TERMINATED", "TERMINATING")
+            and inst.shape == TARGET_SHAPE
         ]
         if active_instances:
             summary.append("### Instance Already Active!")
@@ -269,7 +276,7 @@ def main():
         image = find_ubuntu_image(compute_client, compartment_id)
 
         summary.extend([
-            f"- **Active Instances:** `0`",
+            f"- **Active `{TARGET_SHAPE}` Instances:** `0`",
             f"- **Network:** {subnet_note}",
             f"- **OS Image:** `{image.display_name}`",
             "",
@@ -282,7 +289,10 @@ def main():
         stop_early = False
 
         for attempt in range(1, ATTEMPTS_PER_RUN + 1):
-            for ad in ads:
+            shuffled_ads = list(ads)
+            random.shuffle(shuffled_ads)
+
+            for idx, ad in enumerate(shuffled_ads):
                 ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
                 ad_short = ad.name.split(":")[-1]
                 print(f"[Attempt {attempt}/{ATTEMPTS_PER_RUN}] Launching {TARGET_SHAPE} in {ad_short}...")
@@ -323,11 +333,11 @@ def main():
                         print(f"  -> {status_text}")
                         summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
                     elif e.status == 429 or e.code == "TooManyRequests":
-                        status_text = "TooManyRequests (API සීමාව - මේ වටය නවතයි)"
+                        status_text = "TooManyRequests (තත්පර 65ක් රැඳී සිටී...)"
                         print(f"  -> {status_text}")
                         summary.append(f"| {attempt} | `{ts}` | `{ad_short}` | {status_text} |")
-                        stop_early = True
-                        break
+                        time.sleep(65)
+                        continue
                     elif e.code == "LimitExceeded":
                         status_text = f"LimitExceeded ({redact_sensitive(msg)[:120]})"
                         print(f"  -> {status_text}")
@@ -344,11 +354,17 @@ def main():
                         stop_early = True
                         break
 
+                # එක AD එකකට request යවලා ඊළඟ AD එකට යන්න කලින් තත්පර 12-18ක් delay එකක් දීම
+                if idx < len(shuffled_ads) - 1:
+                    ad_delay = random.uniform(12, 18)
+                    print(f"  -> Waiting {ad_delay:.1f}s before next AD...")
+                    time.sleep(ad_delay)
+
             if stop_early:
                 break
 
             if attempt < ATTEMPTS_PER_RUN:
-                wait_sec = BASE_DELAY_SECONDS + random.randint(0, 10)
+                wait_sec = BASE_DELAY_SECONDS + random.randint(5, 20)
                 print(f"Waiting {wait_sec}s before next attempt...")
                 time.sleep(wait_sec)
 
