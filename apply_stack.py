@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 import oci
 
 TARGET_SHAPE = "VM.Standard.A1.Flex"
-OCPUS = 20.0
-MEMORY_IN_GBS = 64.0
+OCPUS = 4.0
+MEMORY_IN_GBS = 24.0
 INSTANCE_DISPLAY_NAME = "sg-ampere-a1-vps"
 BOOT_VOLUME_GB = 50
 ATTEMPTS_PER_RUN = 5
