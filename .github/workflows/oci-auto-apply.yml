@@ -29,7 +29,7 @@ jobs:
       - name: Install OCI SDK
         run: pip install --quiet oci
 
-      - name: Run ${{ matrix.script }}
+      - name: Run ${{ matrix.script }} with Auto-Retry
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
@@ -37,4 +37,44 @@ jobs:
           OCI_REGION: ${{ secrets.OCI_REGION }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
-        run: python ${{ matrix.script }}
+        run: |
+          # 1. දෙවෙනි script එකට තත්පර 25ක delay එකක් දෙනවා එකම වෙලාවේ request යන එක නවත්තන්න
+          if [ "${{ matrix.script }}" == "apply_stack_02.py" ]; then
+            echo "Waiting 25 seconds before starting second script..."
+            sleep 25
+          fi
+
+          # 2. 429 (Too Many Requests) ආවොත් උපරිම 5 පාරක් Auto-Retry කරන Loop එක
+          MAX_RETRIES=5
+          COUNT=0
+          SUCCESS=false
+
+          while [ $COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempt $((COUNT+1)) of $MAX_RETRIES for ${{ matrix.script }}..."
+            
+            # Python script එක run කරලා output එක log file එකකට ගන්නවා
+            python ${{ matrix.script }} 2>&1 | tee output.log
+            EXIT_CODE=${PIPESTATUS[0]}
+
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "Successfully executed ${{ matrix.script }}!"
+              SUCCESS=true
+              break
+            fi
+
+            # Output එකේ 429 හෝ TooManyRequests තියෙනවද බලනවා
+            if grep -qE "429|TooManyRequests|Too many requests" output.log; then
+              COUNT=$((COUNT+1))
+              WAIT_TIME=$((COUNT * 20)) # පළවෙනි පාර තත්පර 20, දෙවෙනි පාර 40, තුන්වෙනි පාර 60...
+              echo "Rate limit hit (429 Too Many Requests). Waiting ${WAIT_TIME}s before retrying..."
+              sleep $WAIT_TIME
+            else
+              echo "Script failed with a different error. Stopping retries."
+              exit $EXIT_CODE
+            fi
+          done
+
+          if [ "$SUCCESS" = false ]; then
+            echo "Failed after $MAX_RETRIES attempts due to rate limits."
+            exit 1
+          fi
